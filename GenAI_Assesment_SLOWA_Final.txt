@@ -1,0 +1,164 @@
+import os
+import pandas as pd
+import numpy as np
+import yaml
+import json
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+from prophet import Prophet
+from datetime import datetime, timedelta
+
+# 1. **Ingest Metrics Data**
+def load_metrics_data(metrics_folder):
+    metrics_data = []
+    for file in os.listdir(metrics_folder):
+        if file.endswith(".csv"):
+            file_path = os.path.join(metrics_folder, file)
+            df = pd.read_csv(file_path)
+            metrics_data.append(df)
+    return pd.concat(metrics_data, ignore_index=True)
+
+# 2. **Load SLO Targets**
+def load_slo_targets(slo_target_file):
+    with open(slo_target_file, 'r') as f:
+        slo_targets = yaml.safe_load(f)
+    return slo_targets
+
+# 3. **Load System Topology**
+def load_topology(topology_file):
+    with open(topology_file, 'r') as f:
+        topology = json.load(f)
+    return topology
+
+# 4. **Preprocess Metrics Data**
+def preprocess_metrics(metrics_df):
+    metrics_df['timestamp'] = pd.to_datetime(metrics_df['timestamp'])
+    metrics_df.set_index('timestamp', inplace=True)
+    metrics_df.reset_index(inplace=True)  # Ensure 'timestamp' remains a column after resetting the index
+    return metrics_df
+
+
+# 5. **Detect Drift** (Anomaly Detection)
+def detect_drift(metrics_df, column, threshold=2.0):
+    # Using Isolation Forest for anomaly detection
+    model = IsolationForest(contamination=0.1)
+    metrics_df['anomaly'] = model.fit_predict(metrics_df[[column]])
+    drift_points = metrics_df[metrics_df['anomaly'] == -1]
+    return drift_points
+
+# 6. **Forecast Breach Using Prophet**
+def forecast_breach(metrics_df, column, slo_target, forecast_horizon=24):
+    # Explicitly select only the 'timestamp' and the column you're forecasting
+    if 'timestamp' in metrics_df.columns and column in metrics_df.columns:
+        df_prophet = metrics_df[['timestamp', column]].copy()
+    else:
+        raise ValueError(f"Column 'timestamp' or '{column}' not found in the DataFrame.")
+    
+    # Remove timezone from the 'timestamp' column (if any)
+    df_prophet['timestamp'] = df_prophet['timestamp'].dt.tz_localize(None)
+    
+    # Rename the columns for Prophet (ds = date, y = value)
+    df_prophet.columns = ['ds', 'y']
+
+    # Fit the Prophet model
+    model = Prophet()
+    model.fit(df_prophet)
+
+    # Create future data points for prediction using make_future_dataframe
+    # Do NOT pass df_prophet again, just pass the periods and freq
+    future = model.make_future_dataframe(periods=forecast_horizon, freq='H')  # Removed df_prophet
+
+    # Make predictions using the model
+    forecast = model.predict(future)
+
+    # Plotting the forecast
+    plt.figure(figsize=(10, 6))
+    model.plot(forecast)
+    plt.axhline(y=slo_target, color='r', linestyle='--', label='SLO Target')
+
+
+    
+    plt.title(f'{column} Forecast with SLO Target')
+    plt.legend()
+    plt.show()
+
+    # Check if a breach is forecasted (comparison with the SLO target)
+    forecasted_values = forecast[['ds', 'yhat']].tail(forecast_horizon)
+    forecasted_values['breach'] = forecasted_values['yhat'] > slo_target
+    
+    # Return forecasted values with breach information
+    return forecasted_values
+
+
+
+# 7. **Generate Mitigation Plan**
+
+def generate_mitigation_plan(drift_points, forecasted_values, slo_target, topology):
+    mitigation_plan = []
+
+    # Check if drift points are significant
+    if not drift_points.empty:
+        for idx, row in drift_points.iterrows():
+            mitigation_plan.append({
+                'action': 'Investigate drift',
+                'details': f"Anomaly detected in {row.name}, metric exceeded threshold"
+            })
+
+    # If forecast predicts breach
+    if forecasted_values['breach'].any():
+        mitigation_plan.append({
+            'action': 'Scale resources',
+            'details': 'Scale services to handle increased load'
+        })
+        # Add topology-based mitigations (simplified)
+        if 'critical_service' in topology:
+            mitigation_plan.append({
+                'action': 'Adjust load balancing',
+                'details': f"Re-route traffic away from {topology['critical_service']}"
+            })
+    return mitigation_plan
+
+# 8. **Output the Results**
+def output_results(forecasted_values, mitigation_plan):
+    print("\n--- Forecasted Values ---")
+    print(forecasted_values)
+
+    print("\n--- Mitigation Plan ---")
+    for mitigation in mitigation_plan:
+        print(f"{mitigation['action']}: {mitigation['details']}")
+
+# 9. **Main Workflow**
+def main():
+    # Paths to input files
+    metrics_folder = r"C:\users\Administrator\Downloads\dummy_data_package\SLOWA"
+    slo_target_file = r"C:\users\Administrator\Downloads\dummy_data_package\SLOWA\slo_targets.yml"
+    topology_file = r"C:\Users\Administrator\Downloads\dummy_data_package\SLOWA\topology.json"
+
+    # Load the data
+    metrics_df = load_metrics_data(metrics_folder)
+    slo_targets = load_slo_targets(slo_target_file)
+    topology = load_topology(topology_file)
+
+    # Preprocess metrics data
+    metrics_df = preprocess_metrics(metrics_df)
+
+    # Loop over the slo targets
+    for service, metrics in slo_targets.items():
+        print(f"\nAnalyzing SLO for {service}...")
+        for metric_name, slo_value in metrics.items():  # Fixed indentation
+            print(f"metric: {metric_name}  | slo value: {slo_value}")
+            
+            # 1. Drift Detection
+            drift_points = detect_drift(metrics_df, metric_name)
+
+            # 2. Forecasting breach
+            forecasted_values = forecast_breach(metrics_df, metric_name, slo_value)
+
+            # 3. Mitigation Plan
+            mitigation_plan = generate_mitigation_plan(drift_points, forecasted_values, slo_value, topology)
+
+            # 4. Output the results
+            output_results(forecasted_values, mitigation_plan)
+
+if __name__ == '__main__':
+    main()
