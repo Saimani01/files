@@ -1,0 +1,245 @@
+import os
+import pandas as pd
+import numpy as np
+import yaml
+import json
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+from prophet import Prophet
+from datetime import datetime, timedelta
+
+
+# ---------- Load Inputs ----------
+
+METRICS_FILE = "metrics.csv"
+SLO_TARGET_FILE = "slo_targets.yml"
+TOPOLOGY_FILE = "topology.json"
+
+# metrics.csv should have at least:
+# timestamp, service, latency_ms, error_rate, (optionally throughput_rps, etc.)
+
+df = pd.read_csv(METRICS_FILE, parse_dates=["timestamp"])
+
+with open(SLO_TARGET_FILE, "r") as f:
+    slo_targets = yaml.safe_load(f)
+
+with open(TOPOLOGY_FILE, "r") as f:
+    topology = json.load(f)
+
+
+# ---------- Preprocess Metrics ----------
+
+def preprocess_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    metrics_df = metrics_df.copy()
+    metrics_df["timestamp"] = pd.to_datetime(metrics_df["timestamp"], errors="coerce")
+    metrics_df = metrics_df.dropna(subset=["timestamp"])
+    metrics_df = metrics_df.sort_values("timestamp")
+    return metrics_df
+
+
+df = preprocess_metrics(df)
+
+
+# ---------- Detect Drift (Isolation Forest) ----------
+
+def detect_drift(service_df: pd.DataFrame, column: str, contamination: float = 0.1) -> pd.DataFrame:
+    """
+    Run IsolationForest on a single metric for a single service.
+    Returns rows considered anomalies.
+    """
+    service_df = service_df.copy()
+    if column not in service_df.columns:
+        return service_df.iloc[0:0]  # empty
+
+    # Only use non-null values
+    clean = service_df[[column]].dropna()
+    if clean.empty:
+        return service_df.iloc[0:0]
+
+    model = IsolationForest(contamination=contamination, random_state=42)
+    preds = model.fit_predict(clean[[column]])
+
+    clean = clean.copy()
+    clean["anomaly"] = preds
+
+    # Map anomaly flag back to original df
+    service_df = service_df.join(clean["anomaly"], how="left")
+    drift_points = service_df[service_df["anomaly"] == -1]
+    return drift_points
+
+
+# ---------- Forecast Breach Using Prophet ----------
+
+def forecast_breach(service_df: pd.DataFrame, column: str, slo_target: float, forecast_horizon: int = 24):
+    """
+    Forecast the metric for a single service using Prophet.
+    Returns forecasted values with a 'breach' flag vs SLO.
+    """
+    if column not in service_df.columns:
+        return None
+
+    df_prophet = service_df[["timestamp", column]].dropna().copy()
+    df_prophet = df_prophet.rename(columns={"timestamp": "ds", column: "y"})
+
+    # Prophet needs enough data
+    if len(df_prophet) < 10:
+        return None
+
+    model = Prophet()
+    model.fit(df_prophet)
+
+    # Forecast in hourly steps (adjust freq depending on your data cadence)
+    future = model.make_future_dataframe(periods=forecast_horizon, freq="H")
+    forecast = model.predict(future)
+
+    # Optional visualization (comment out if running headless)
+    plt.figure(figsize=(10, 6))
+    model.plot(forecast)
+    plt.axhline(y=slo_target, color="r", linestyle="--", label="SLO Target")
+    plt.title(f"{column} forecast vs SLO ({slo_target})")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Tail section only for horizon window
+    tail = forecast[["ds", "yhat"]].tail(forecast_horizon).copy()
+    tail["breach"] = tail["yhat"] > slo_target
+    return tail
+
+
+# ---------- Generate Mitigation Plan ----------
+
+def generate_mitigation_plan(service: str,
+                             metric: str,
+                             drift_points: pd.DataFrame,
+                             forecasted_values,
+                             slo_target: float,
+                             topology: dict):
+    plan = []
+
+    # Drift-based mitigations
+    if drift_points is not None and not drift_points.empty:
+        plan.append({
+            "action": "Investigate drift",
+            "details": f"Anomalies detected in {service}.{metric} at {len(drift_points)} timestamps"
+        })
+
+    # Forecast-based mitigations
+    if forecasted_values is not None and forecasted_values["breach"].any():
+        plan.append({
+            "action": "Scale resources",
+            "details": f"{service}.{metric} is forecasted to breach SLO ({slo_target}) soon; scale out or optimize."
+        })
+
+        # Simple topology-based suggestion
+        svc_topo = topology.get("services", {}).get(service)
+        if svc_topo and svc_topo.get("depends_on"):
+            deps = ", ".join(svc_topo["depends_on"])
+            plan.append({
+                "action": "Check dependencies",
+                "details": f"{service} depends on {deps}; validate their health and capacity."
+            })
+
+    if not plan:
+        plan.append({
+            "action": "Monitor",
+            "details": f"No immediate issues forecasted for {service}.{metric}; continue monitoring."
+        })
+
+    return plan
+
+
+# ---------- Output Helpers ----------
+
+def output_results(service: str,
+                   metric: str,
+                   slo_value: float,
+                   drift_points: pd.DataFrame,
+                   forecasted_values,
+                   service_df: pd.DataFrame,
+                   mitigation_plan):
+    print(f"\n=== SLO ANALYSIS: {service} / {metric} ===")
+    latest = service_df.sort_values("timestamp").iloc[-1]
+
+    print("  Latest metric:")
+    print(f"    timestamp: {latest.timestamp}")
+    print(f"    value:     {latest[metric]}")
+    print(f"    SLO:       {slo_value}")
+
+    print(f"  Drift anomalies: {0 if drift_points is None else len(drift_points)}")
+
+    if forecasted_values is not None:
+        first_breach = forecasted_values[forecasted_values["breach"]].head(1)
+        if not first_breach.empty:
+            eta = first_breach.iloc[0]["ds"]
+            print(f"  Forecasted breach: YES at {eta}")
+        else:
+            print("  Forecasted breach: NO in horizon")
+    else:
+        print("  Forecasted breach: Not enough data for Prophet")
+
+    print("\n  Mitigation plan:")
+    for step in mitigation_plan:
+        print(f"    - {step['action']}: {step['details']}")
+    print("-" * 60)
+
+
+# ---------- Main ----------
+
+def main():
+    # We assume slo_targets like:
+    # service:
+    #   latency_ms: 200
+    #   error_rate: 0.01
+
+    services = df["service"].unique()
+
+    print("\n=== SLO PREDICTION & MITIGATION REPORT ===\n")
+
+    for service in services:
+        if service not in slo_targets:
+            print(f"\nSkipping service {service}: not in slo_targets.yml")
+            continue
+
+        svc_slo = slo_targets[service]
+        svc_df = df[df["service"] == service].copy()
+        if svc_df.empty:
+            print(f"\nNo metrics for service {service}")
+            continue
+
+        # For each metric defined in SLO for this service
+        for metric_name, slo_value in svc_slo.items():
+            if metric_name not in svc_df.columns:
+                print(f"\nService {service}: metric '{metric_name}' not found in metrics.csv; skipping.")
+                continue
+
+            # 1. Drift detection
+            drift_points = detect_drift(svc_df, metric_name)
+
+            # 2. Forecast breach
+            forecasted_values = forecast_breach(svc_df, metric_name, slo_value)
+
+            # 3. Mitigation plan
+            mitigation_plan = generate_mitigation_plan(
+                service,
+                metric_name,
+                drift_points,
+                forecasted_values,
+                slo_value,
+                topology
+            )
+
+            # 4. Output results
+            output_results(
+                service,
+                metric_name,
+                slo_value,
+                drift_points,
+                forecasted_values,
+                svc_df,
+                mitigation_plan
+            )
+
+
+if __name__ == "__main__":
+    main()
