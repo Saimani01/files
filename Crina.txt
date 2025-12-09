@@ -1,0 +1,204 @@
+import os
+import json
+import glob
+from datetime import datetime, timedelta
+
+import pandas as pd
+import yaml
+
+CMDB_PATH = "cmdb/*.json"
+DISC_PATH = "discovery/*.csv"
+RULES_FILE = "rules.yml"
+CHANGESET_MD = "cmdb_changeset.md"
+EVIDENCE_CSV = "cmdb_reconciliation_evidence.csv"
+
+
+# ---------- Load Inputs ----------
+
+def load_cmdb():
+    rows = []
+    for path in glob.glob(CMDB_PATH):
+        with open(path, "r") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                rows.append(data)
+            else:
+                rows.extend(data)
+    return pd.DataFrame(rows)
+
+
+def load_discovery():
+    frames = [pd.read_csv(p) for p in glob.glob(DISC_PATH)]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+with open(RULES_FILE, "r") as f:
+    rules = yaml.safe_load(f)
+
+cmdb_df = load_cmdb()
+disc_df = load_discovery()
+
+# normalize timestamps
+for df, col in [(cmdb_df, "last_seen"), (disc_df, "last_seen")]:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+disc_df["source_path"] = disc_df.get("source", "")  # optional
+
+
+# ---------- Matching ----------
+
+def match_record(d_row, cmdb_df, match_rules):
+    for key_set in match_rules:
+        subset = cmdb_df.copy()
+        for k in key_set:
+            if k not in d_row or k not in subset.columns:
+                subset = subset.iloc[0:0]
+                break
+            subset = subset[subset[k] == d_row[k]]
+        if len(subset) == 1:
+            return subset.iloc[0]
+        elif len(subset) > 1:
+            # multi-match -> treat as duplicate CI cluster, but return first for now
+            return subset.iloc[0]
+    return None
+
+
+match_rules = rules.get("match_keys", [["hostname"]])
+
+links = []  # evidence rows
+
+for idx, d in disc_df.iterrows():
+    cmdb_match = match_record(d, cmdb_df, match_rules)
+    links.append({
+        "disc_index": idx,
+        "disc_hostname": d.get("hostname"),
+        "disc_ip": d.get("ip"),
+        "cmdb_ci_id": cmdb_match.get("ci_id") if cmdb_match is not None else None
+    })
+
+links_df = pd.DataFrame(links)
+
+# Mark matched / orphan discovery
+disc_df["cmdb_ci_id"] = links_df["cmdb_ci_id"]
+orphan_discovery = disc_df[disc_df["cmdb_ci_id"].isna()]
+
+# For each CMDB CI, find last_seen from discovery
+cmdb_df["matched_disc_count"] = cmdb_df["ci_id"].map(
+    disc_df.groupby("cmdb_ci_id").size().to_dict()
+).fillna(0).astype(int)
+
+
+# ---------- Stale Detection ----------
+
+stale_days = rules.get("stale_after_days", 14)
+cutoff = datetime.utcnow() - timedelta(days=stale_days)
+
+def is_stale(row):
+    if row["matched_disc_count"] > 0:
+        return False
+    ls = row.get("last_seen")
+    if pd.isna(ls):
+        return True
+    return ls < cutoff
+
+cmdb_df["stale"] = cmdb_df.apply(is_stale, axis=1)
+
+
+# ---------- Propose Changes ----------
+
+changes = []
+
+# 1) New CIs for orphan discovery
+for _, d in orphan_discovery.iterrows():
+    changes.append({
+        "type": "CREATE",
+        "ci_id": None,
+        "hostname": d.get("hostname"),
+        "ip": d.get("ip"),
+        "reason": "Observed in discovery, not present in CMDB",
+        "evidence_index": int(d.name)
+    })
+
+# 2) Retire stale CIs
+for _, c in cmdb_df[cmdb_df["stale"]].iterrows():
+    changes.append({
+        "type": "RETIRE",
+        "ci_id": c.get("ci_id"),
+        "hostname": c.get("hostname"),
+        "ip": c.get("ip"),
+        "reason": f"No discovery match for > {stale_days} days",
+        "evidence_index": None
+    })
+
+# 3) UPDATE mismatched fields (simple example for hostname/ip/os)
+fields_to_sync = rules.get("fields_to_sync", ["hostname", "ip", "os"])
+
+for _, d in disc_df[disc_df["cmdb_ci_id"].notna()].iterrows():
+    ci_id = d["cmdb_ci_id"]
+    c = cmdb_df[cmdb_df["ci_id"] == ci_id]
+    if c.empty:
+        continue
+    c = c.iloc[0]
+    diffs = {}
+    for fld in fields_to_sync:
+        if fld in d and fld in c and pd.notna(d[fld]) and d[fld] != c[fld]:
+            diffs[fld] = {"cmdb": c[fld], "discovery": d[fld]}
+    if diffs:
+        changes.append({
+            "type": "UPDATE",
+            "ci_id": ci_id,
+            "hostname": c.get("hostname"),
+            "ip": c.get("ip"),
+            "reason": "Field mismatch between CMDB and discovery",
+            "diffs": diffs,
+            "evidence_index": int(d.name)
+        })
+
+changes_df = pd.DataFrame(changes)
+
+
+# ---------- Emit Evidence Pack ----------
+
+evidence = []
+for _, ch in changes_df.iterrows():
+    ev_idx = ch.get("evidence_index")
+    disc_row = disc_df.loc[ev_idx].to_dict() if ev_idx is not None and ev_idx in disc_df.index else {}
+    evidence.append({
+        "change_type": ch["type"],
+        "ci_id": ch["ci_id"],
+        "reason": ch["reason"],
+        "diffs": ch.get("diffs"),
+        "discovery_row": disc_row
+    })
+
+evidence_df = pd.DataFrame(evidence)
+evidence_df.to_csv(EVIDENCE_CSV, index=False)
+
+
+# ---------- Emit Changeset Markdown (no auto-writes) ----------
+
+with open(CHANGESET_MD, "w") as f:
+    f.write("# CMDB Reconciliation Changeset (Dry Run)\n\n")
+    f.write("**Guardrail:** No changes applied automatically. Review and apply via CM process.\n\n")
+
+    for change_type in ["CREATE", "UPDATE", "RETIRE"]:
+        subset = changes_df[changes_df["type"] == change_type]
+        f.write(f"## {change_type}s ({len(subset)})\n\n")
+        if subset.empty:
+            f.write("_None_\n\n")
+            continue
+        for _, ch in subset.iterrows():
+            f.write(f"- CI: `{ch.get('ci_id')}` host: `{ch.get('hostname')}` ip: `{ch.get('ip')}`\n")
+            f.write(f"  - Reason: {ch['reason']}\n")
+            if isinstance(ch.get("diffs"), dict):
+                f.write("  - Diffs:\n")
+                for fld, vals in ch["diffs"].items():
+                    f.write(f"    - {fld}: CMDB=`{vals['cmdb']}` ? Discovery=`{vals['discovery']}`\n")
+            f.write("\n")
+
+print(f"Changeset written to {CHANGESET_MD}")
+print(f"Evidence pack written to {EVIDENCE_CSV}")
+print("\nDry-run only. No CMDB writes performed.")
