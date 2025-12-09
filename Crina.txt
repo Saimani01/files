@@ -1,466 +1,59 @@
-import os
 import json
-import glob
-from datetime import datetime, timedelta
-
-import pandas as pd
-import yaml
-
-CMDB_PATH = "cmdb/*.json"import os
-import json
-import glob
 import yaml
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
-# ---------- Load Inputs ----------
+# 1) Load data
+cmdb_assets = []
+for path in glob.glob("cmdb/*.json"):
+    with open(path) as f:
+        cmdb_assets.extend(json.load(f)["assets"])
 
-def load_cmdb(cmdb_folder="cmdb"):
-    records = []
-    for path in glob.glob(os.path.join(cmdb_folder, "*.json")):
-        with open(path, "r") as f:
-            data = json.load(f)
-        for asset in data.get("assets", []):
-            asset["_source_file"] = os.path.basename(path)
-            records.append(asset)
-    return pd.DataFrame(records)
+disc_df = pd.read_csv("discovery.csv", parse_dates=["last_seen"])
 
-
-def load_discovery(discovery_folder="discovery"):
-    frames = []
-    for path in glob.glob(os.path.join(discovery_folder, "*.csv")):
-        df = pd.read_csv(path)
-        df["_source_file"] = os.path.basename(path)
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def load_rules(rules_file="rules.yml"):
-    with open(rules_file, "r") as f:
-        return yaml.safe_load(f)
-
-
-cmdb_df = load_cmdb("cmdb")
-disco_df = load_discovery("discovery")
-rules = load_rules("rules.yml")  # e.g., thresholds, stale_days, env mappings
-
-
-# ---------- Normalize ----------
-
-def normalize(df_cmdb, df_disco):
-    df_cmdb = df_cmdb.copy()
-    df_disco = df_disco.copy()
-
-    # Normalize hostnames & IP
-    if "id" in df_cmdb.columns:
-        df_cmdb["id_norm"] = df_cmdb["id"].str.lower()
-    if "hostname" in df_disco.columns:
-        df_disco["hostname_norm"] = df_disco["hostname"].str.lower()
-
-    for col in ["ip", "IP", "ip_address"]:
-        if col in df_cmdb.columns:
-            df_cmdb["ip_norm"] = df_cmdb[col].astype(str).str.strip()
-        if col in df_disco.columns:
-            df_disco["ip_norm"] = df_disco[col].astype(str).str.strip()
-
-    # Parse last_seen if present
-    if "last_seen" in df_disco.columns:
-        df_disco["last_seen"] = pd.to_datetime(df_disco["last_seen"], errors="coerce")
-
-    return df_cmdb, df_disco
-
-
-cmdb_df, disco_df = normalize(cmdb_df, disco_df)
-
-
-# ---------- Rule-based Matching ----------
-
-def rule_match(cmdb_df, disco_df):
-    # Simple IP-based join first
-    if "ip_norm" not in cmdb_df.columns or "ip_norm" not in disco_df.columns:
-        return pd.DataFrame()
-
-    merged = disco_df.merge(
-        cmdb_df,
-        on="ip_norm",
-        how="left",
-        suffixes=("_disco", "_cmdb"),
-    )
-    return merged
-
-
-matched_df = rule_match(cmdb_df, disco_df)
-
-
-# ---------- Identify Candidates for GenAI Help ----------
-
-def classify_candidates(matched_df, stale_days=90):
-    """
-    Create three buckets:
-      - exact_matches: CMDB id present and reasonable
-      - possible_stale: CMDB active but not seen in N days
-      - ambiguous: missing CMDB id or conflicting info -> send to LLM
-    """
-    now = datetime.utcnow()
-    exact_matches = []
-    stale = []
-    ambiguous = []
-
-    for _, row in matched_df.iterrows():
-        cmdb_id = row.get("id")
-        status = row.get("status", "")
-        last_seen = row.get("last_seen")
-        owner_cmdb = row.get("owner", "")
-        owner_disco = row.get("owner_discovery", "")
-
-        # exact if we have an id and status active and recent last_seen
-        if pd.notna(cmdb_id) and pd.notna(last_seen):
-            age_days = (now - last_seen.to_pydatetime()).days
-            if age_days <= stale_days:
-                exact_matches.append(row)
-                continue
-            else:
-                # potential stale
-                if str(status).lower() == "active":
-                    stale.append(row)
-                    continue
-
-        # ambiguous if no cmdb id or conflicting owners / multiple matches
-        ambiguous.append(row)
-
-    return (
-        pd.DataFrame(exact_matches),
-        pd.DataFrame(stale),
-        pd.DataFrame(ambiguous),
-    )
-
-
-exact_df, stale_df, ambiguous_df = classify_candidates(matched_df, stale_days=rules.get("stale_days", 90))
-
-
-# ---------- GenAI Call Helper (placeholder) ----------
-
-def call_llm(prompt: str) -> str:
-    """
-    Placeholder for GenAI API call.
-    You'd implement this with OpenAI/Bedrock/etc.
-    """
-    # TODO: implement your actual LLM call here.
-    # For now, just return placeholder.
-    return "LLM_RESPONSE_PLACEHOLDER"
-
-
-# ---------- Use GenAI to Propose Reconciliation ----------
-
-def build_match_prompt(cmdb_row, disco_row):
-    return f"""
-You are helping reconcile a CMDB with live discovery data.
-
-CMDB asset:
-{json.dumps(cmdb_row, indent=2, default=str)}
-
-Discovery record:
-{json.dumps(disco_row, indent=2, default=str)}
-
-Task:
-1. Decide if these represent the SAME asset (answer: yes/no/unsure).
-2. If yes, list any CMDB fields that should be updated (status, owner, ip, etc.).
-3. If discovery shows a host that is missing from CMDB, suggest creating a new record.
-4. Respond in concise JSON with keys: decision, updates[], rationale.
-"""
-
-
-def build_stale_prompt(cmdb_row):
-    return f"""
-You are reviewing a CMDB asset that may be stale.
-
-CMDB asset:
-{json.dumps(cmdb_row, indent=2, default=str)}
-
-Discovery data suggests this host has not been seen recently.
-
-Task:
-1. Decide if the asset is likely stale (yes/no/unsure).
-2. If yes, propose setting status to 'retired' or similar.
-3. Provide a brief rationale.
-
-Respond in JSON with keys: decision, suggested_status, rationale.
-"""
-
-
-def genai_reconcile(stale_df, ambiguous_df):
-    proposals = []
-
-    # Stale candidates
-    for _, row in stale_df.iterrows():
-        cmdb_view = {
-            "id": row.get("id"),
-            "ip": row.get("ip_norm"),
-            "owner": row.get("owner"),
-            "status": row.get("status"),
-            "source_file": row.get("_source_file"),
-        }
-        prompt = build_stale_prompt(cmdb_view)
-        resp = call_llm(prompt)
-        proposals.append({
-            "type": "stale_review",
-            "cmdb_id": row.get("id"),
-            "llm_raw": resp
-        })
-
-    # Ambiguous matches
-    for _, row in ambiguous_df.iterrows():
-        cmdb_view = {
-            "id": row.get("id"),
-            "ip": row.get("ip_norm"),
-            "owner": row.get("owner"),
-            "status": row.get("status"),
-            "source_file": row.get("_source_file"),
-        }
-        disco_view = {
-            "hostname": row.get("hostname_norm"),
-            "ip": row.get("ip_norm"),
-            "last_seen": str(row.get("last_seen")),
-            "env": row.get("env"),
-            "source_file": row.get("_source_file_disco", row.get("_source_file")),
-        }
-        prompt = build_match_prompt(cmdb_view, disco_view)
-        resp = call_llm(prompt)
-        proposals.append({
-            "type": "match_review",
-            "cmdb_id": row.get("id"),
-            "discovery_host": row.get("hostname_norm"),
-            "llm_raw": resp
-        })
-
-    return proposals
-
-
-proposals = genai_reconcile(stale_df, ambiguous_df)
-
-
-# ---------- Generate Changeset Markdown + Evidence ----------
-
-def write_changeset_markdown(proposals, output_file="cmdb_changeset.md"):
-    lines = []
-    lines.append("# CMDB Reconciliation Changeset (Proposed)")
-    lines.append("")
-    lines.append("> Generated by GenAI-assisted pipeline. No changes applied automatically.")
-    lines.append("")
-
-    for p in proposals:
-        lines.append("---")
-        lines.append(f"**Type:** {p['type']}")
-        lines.append(f"**CMDB ID:** {p.get('cmdb_id')}")
-        if "discovery_host" in p:
-            lines.append(f"**Discovery Host:** {p['discovery_host']}")
-        lines.append("")
-        lines.append("```json")
-        lines.append(p["llm_raw"])
-        lines.append("```")
-        lines.append("")
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    print(f"\nChangeset markdown written to: {output_file}")
-
-
-write_changeset_markdown(proposals)
-
-DISC_PATH = "discovery/*.csv"
-RULES_FILE = "rules.yml"
-CHANGESET_MD = "cmdb_changeset.md"
-EVIDENCE_CSV = "cmdb_reconciliation_evidence.csv"
-
-
-# ---------- Load Inputs ----------
-
-def load_cmdb():
-    rows = []
-    for path in glob.glob(CMDB_PATH):
-        with open(path, "r") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                rows.append(data)
-            else:
-                rows.extend(data)
-    return pd.DataFrame(rows)
-
-
-def load_discovery():
-    frames = [pd.read_csv(p) for p in glob.glob(DISC_PATH)]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-with open(RULES_FILE, "r") as f:
+with open("rules.yml") as f:
     rules = yaml.safe_load(f)
 
-cmdb_df = load_cmdb()
-disc_df = load_discovery()
+# 2) Dedupe discovery by host+ip, prefer latest last_seen
+disc_df = (disc_df
+           .sort_values("last_seen")
+           .drop_duplicates(subset=["host", "ip"], keep="last"))
 
-# normalize timestamps
-for df, col in [(cmdb_df, "last_seen"), (disc_df, "last_seen")]:
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+# 3) Build candidate objects (rule-based)
+candidates = []
+now = datetime.now(timezone.utc)
 
-disc_df["source_path"] = disc_df.get("source", "")  # optional
+for asset in cmdb_assets:
+    host = asset["id"]
+    ip = asset.get("ip")
 
+    matches = disc_df[(disc_df["host"] == host) & (disc_df["ip"] == ip)]
+    matches_dict = matches.to_dict(orient="records")
 
-# ---------- Matching ----------
-
-def match_record(d_row, cmdb_df, match_rules):
-    for key_set in match_rules:
-        subset = cmdb_df.copy()
-        for k in key_set:
-            if k not in d_row or k not in subset.columns:
-                subset = subset.iloc[0:0]
-                break
-            subset = subset[subset[k] == d_row[k]]
-        if len(subset) == 1:
-            return subset.iloc[0]
-        elif len(subset) > 1:
-            # multi-match -> treat as duplicate CI cluster, but return first for now
-            return subset.iloc[0]
-    return None
-
-
-match_rules = rules.get("match_keys", [["hostname"]])
-
-links = []  # evidence rows
-
-for idx, d in disc_df.iterrows():
-    cmdb_match = match_record(d, cmdb_df, match_rules)
-    links.append({
-        "disc_index": idx,
-        "disc_hostname": d.get("hostname"),
-        "disc_ip": d.get("ip"),
-        "cmdb_ci_id": cmdb_match.get("ci_id") if cmdb_match is not None else None
+    candidates.append({
+        "cmdb_record": asset,
+        "discovery_records": matches_dict,
+        "rules": rules
     })
 
-links_df = pd.DataFrame(links)
-
-# Mark matched / orphan discovery
-disc_df["cmdb_ci_id"] = links_df["cmdb_ci_id"]
-orphan_discovery = disc_df[disc_df["cmdb_ci_id"].isna()]
-
-# For each CMDB CI, find last_seen from discovery
-cmdb_df["matched_disc_count"] = cmdb_df["ci_id"].map(
-    disc_df.groupby("cmdb_ci_id").size().to_dict()
-).fillna(0).astype(int)
-
-
-# ---------- Stale Detection ----------
-
-stale_days = rules.get("stale_after_days", 14)
-cutoff = datetime.utcnow() - timedelta(days=stale_days)
-
-def is_stale(row):
-    if row["matched_disc_count"] > 0:
-        return False
-    ls = row.get("last_seen")
-    if pd.isna(ls):
-        return True
-    return ls < cutoff
-
-cmdb_df["stale"] = cmdb_df.apply(is_stale, axis=1)
-
-
-# ---------- Propose Changes ----------
-
-changes = []
-
-# 1) New CIs for orphan discovery
-for _, d in orphan_discovery.iterrows():
-    changes.append({
-        "type": "CREATE",
-        "ci_id": None,
-        "hostname": d.get("hostname"),
-        "ip": d.get("ip"),
-        "reason": "Observed in discovery, not present in CMDB",
-        "evidence_index": int(d.name)
-    })
-
-# 2) Retire stale CIs
-for _, c in cmdb_df[cmdb_df["stale"]].iterrows():
-    changes.append({
-        "type": "RETIRE",
-        "ci_id": c.get("ci_id"),
-        "hostname": c.get("hostname"),
-        "ip": c.get("ip"),
-        "reason": f"No discovery match for > {stale_days} days",
-        "evidence_index": None
-    })
-
-# 3) UPDATE mismatched fields (simple example for hostname/ip/os)
-fields_to_sync = rules.get("fields_to_sync", ["hostname", "ip", "os"])
-
-for _, d in disc_df[disc_df["cmdb_ci_id"].notna()].iterrows():
-    ci_id = d["cmdb_ci_id"]
-    c = cmdb_df[cmdb_df["ci_id"] == ci_id]
-    if c.empty:
-        continue
-    c = c.iloc[0]
-    diffs = {}
-    for fld in fields_to_sync:
-        if fld in d and fld in c and pd.notna(d[fld]) and d[fld] != c[fld]:
-            diffs[fld] = {"cmdb": c[fld], "discovery": d[fld]}
-    if diffs:
-        changes.append({
-            "type": "UPDATE",
-            "ci_id": ci_id,
-            "hostname": c.get("hostname"),
-            "ip": c.get("ip"),
-            "reason": "Field mismatch between CMDB and discovery",
-            "diffs": diffs,
-            "evidence_index": int(d.name)
+# Also consider discovery-only hosts as NEW_ASSET candidates
+cmdb_hosts = {a["id"] for a in cmdb_assets}
+for _, row in disc_df.iterrows():
+    if row["host"] not in cmdb_hosts:
+        candidates.append({
+            "cmdb_record": None,
+            "discovery_records": [row.to_dict()],
+            "rules": rules
         })
 
-changes_df = pd.DataFrame(changes)
+# 4) Call LLM per candidate
+decisions = []
+for c in candidates:
+    prompt = build_prompt(c)  # format the JSON + instructions
+    llm_output = call_llm(prompt)  # GenAI call (Bedrock/OpenAI/etc.)
+    decisions.append(parse_llm_output(llm_output))
 
-
-# ---------- Emit Evidence Pack ----------
-
-evidence = []
-for _, ch in changes_df.iterrows():
-    ev_idx = ch.get("evidence_index")
-    disc_row = disc_df.loc[ev_idx].to_dict() if ev_idx is not None and ev_idx in disc_df.index else {}
-    evidence.append({
-        "change_type": ch["type"],
-        "ci_id": ch["ci_id"],
-        "reason": ch["reason"],
-        "diffs": ch.get("diffs"),
-        "discovery_row": disc_row
-    })
-
-evidence_df = pd.DataFrame(evidence)
-evidence_df.to_csv(EVIDENCE_CSV, index=False)
-
-
-# ---------- Emit Changeset Markdown (no auto-writes) ----------
-
-with open(CHANGESET_MD, "w") as f:
-    f.write("# CMDB Reconciliation Changeset (Dry Run)\n\n")
-    f.write("**Guardrail:** No changes applied automatically. Review and apply via CM process.\n\n")
-
-    for change_type in ["CREATE", "UPDATE", "RETIRE"]:
-        subset = changes_df[changes_df["type"] == change_type]
-        f.write(f"## {change_type}s ({len(subset)})\n\n")
-        if subset.empty:
-            f.write("_None_\n\n")
-            continue
-        for _, ch in subset.iterrows():
-            f.write(f"- CI: `{ch.get('ci_id')}` host: `{ch.get('hostname')}` ip: `{ch.get('ip')}`\n")
-            f.write(f"  - Reason: {ch['reason']}\n")
-            if isinstance(ch.get("diffs"), dict):
-                f.write("  - Diffs:\n")
-                for fld, vals in ch["diffs"].items():
-                    f.write(f"    - {fld}: CMDB=`{vals['cmdb']}` ? Discovery=`{vals['discovery']}`\n")
-            f.write("\n")
-
-print(f"Changeset written to {CHANGESET_MD}")
-print(f"Evidence pack written to {EVIDENCE_CSV}")
-print("\nDry-run only. No CMDB writes performed.")
-
+# 5) Render changeset markdown + evidence JSON
+render_changeset_markdown(decisions, "cmdb_changeset.md")
+with open("evidence_pack.json", "w") as f:
+    json.dump(decisions, f, indent=2)
